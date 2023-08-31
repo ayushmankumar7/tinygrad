@@ -3,26 +3,20 @@
 #import typeguard.importhook
 #typeguard.importhook.install_import_hook('tinygrad')
 
-import os
-import sys, argparse, math, platform
+from pathlib import Path
+import functools, sys, argparse, json, os
 import numpy as np
-from tqdm import tqdm
 np.set_printoptions(linewidth=200)
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
-from tinygrad.helpers import getenv, DEBUG
-from tinygrad.lazy import Device
-
-# on mac, we make METAL the default. otherwise we make the GPU the default if we have one
-if not getenv("CPU") and Device.DEFAULT == "CPU":
-  if platform.system() == "Darwin" and Device["METAL"] is not None: Device.DEFAULT = "METAL"
-  elif Device["GPU"] is not None: Device.DEFAULT = "GPU"
-
-from extra.helpers import Timing
+from tinygrad.helpers import Timing, getenv, DEBUG, dtypes
+from tinygrad.ops import Device
 from tinygrad.tensor import Tensor
-from tinygrad.nn import Linear
+from tinygrad.nn import Embedding, Linear
+from tinygrad.nn.state import safe_load, torch_load, load_state_dict
 from tinygrad.ops import GlobalCounters
 from tinygrad.jit import TinyJit
+from tinygrad.shape.symbolic import Variable, sym_infer
 
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -31,10 +25,8 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
   return np.stack([np.cos(freqs), np.sin(freqs)], axis=-1).reshape(1, end, 1, dim//2, 2)
 
 # (a+i*b) * (c+i*d) = (ac-bd) + i*(ad+bc)
-def complex_mult(A, B):
-  assert len(A.shape) == 5 and len(B.shape) == 5
+def complex_mult(A, c, d):
   a,b = A[:, :, :, :, 0:1], A[:, :, :, :, 1:2]
-  c,d = B[:, :, :, :, 0:1], B[:, :, :, :, 1:2]
   ro = a*c - b*d
   co = a*d + b*c
   return ro.cat(co, dim=-1)
@@ -43,9 +35,16 @@ def apply_rotary_emb(xq, xk, freqs_cis) -> Tuple[Tensor, Tensor]:
   assert freqs_cis.shape[1] == xq.shape[1] and freqs_cis.shape[1] == xk.shape[1], f"freqs_cis shape mismatch {freqs_cis.shape} xq:{xq.shape} xk:{xk.shape}"
   xq = xq.reshape(*xq.shape[0:-1], -1, 2)
   xk = xk.reshape(*xk.shape[0:-1], -1, 2)
-  xq_out = complex_mult(xq, freqs_cis)
-  xk_out = complex_mult(xk, freqs_cis)
+  assert len(xq.shape) == 5 and len(xk.shape) == 5 and len(freqs_cis.shape) == 5
+  c, d = freqs_cis[:, :xq.shape[1], :, :, 0:1], freqs_cis[:, :xq.shape[1], :, :, 1:2]
+  xq_out = complex_mult(xq, c, d)
+  xk_out = complex_mult(xk, c, d)
   return xq_out.flatten(3), xk_out.flatten(3)
+
+def repeat_kv(x:Tensor, n_rep:int) -> Tensor:
+  bs, seqlen, n_kv_heads, head_dim = x.shape
+  if n_rep == 1: return x
+  return x[:, :, :, None, :].expand(bs, seqlen, n_kv_heads, n_rep, head_dim).reshape(bs, seqlen, n_kv_heads * n_rep, head_dim)
 
 class RMSNorm:
   def __init__(self, dim, eps=1e-6):
@@ -57,157 +56,273 @@ class RMSNorm:
     return (x * (x.pow(2).mean(-1, keepdim=True) + self.eps).rsqrt()) * self.weight
 
 class Attention:
-  def __init__(self, dim, n_heads):
-    self.wq, self.wk, self.wv, self.wo = [Linear(dim, dim, bias=False) for _ in range(4)]
+  def __init__(self, dim, n_heads, n_kv_heads, linear=Linear):
     self.n_heads = n_heads
+    self.n_kv_heads = n_kv_heads if n_kv_heads is not None else n_heads
     self.head_dim = dim // n_heads
+    self.n_rep = self.n_heads // self.n_kv_heads
 
-  def prepare_attention(self, x:Tensor, freqs_cis:Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    self.wq = linear(dim, self.n_heads * self.head_dim, bias=False)
+    self.wk = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+    self.wv = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+    self.wo = linear(self.n_heads * self.head_dim, dim, bias=False)
+
+  def __call__(self, x:Tensor, cache_k:Optional[Tensor], cache_v:Optional[Tensor], start_pos:int, freqs_cis:Tensor, mask:Optional[Tensor], jit_ctx:Optional[Dict[Variable,int]]=None) -> Tuple[Tensor, Tensor, Tensor]:
+    bsz, seqlen, _ = x.shape
     xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-    xq, xk, xv = [x.reshape(x.shape[0], x.shape[1], self.n_heads, self.head_dim) for x in (xq, xk, xv)]
+    xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
+    xk = xk.reshape(xk.shape[0], xk.shape[1], self.n_kv_heads, self.head_dim)
+    xv = xv.reshape(xv.shape[0], xv.shape[1], self.n_kv_heads, self.head_dim)
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-    return xq, xk, xv
 
-  def inner_attention(self, xq:Tensor, xk:Tensor, xv:Tensor, start_pos:int, mask:Optional[Tensor]) -> Tensor:
-    bsz, seqlen, _, _ = xq.shape
     # kv caching!
     if start_pos == 0:
       keys, values = xk, xv
     else:
-      assert hasattr(self, 'cache_k'), "no cache"
-      assert start_pos == self.cache_k.shape[1] and start_pos == self.cache_v.shape[1], "cache is wrong shape"
+      assert cache_k is not None and cache_v is not None, "no cache"
+      assert start_pos == sym_infer(cache_k.shape[1], cache_k.lazydata.st.var_vals) == sym_infer(cache_v.shape[1], cache_v.lazydata.st.var_vals), f"cache has wrong shape, not ({start_pos} == {sym_infer(cache_k.shape[1], cache_k.lazydata.st.var_vals)} == {sym_infer(cache_v.shape[1], cache_v.lazydata.st.var_vals)})"
       assert seqlen == xk.shape[1] and seqlen == xv.shape[1], "seqlen is wrong shape?!?"
-      keys, values = self.cache_k.cat(xk, dim=1), self.cache_v.cat(xv, dim=1)
+      keys, values = cache_k.cat(xk, dim=1), cache_v.cat(xv, dim=1)
 
-    # save the cache
-    self.cache_k, self.cache_v = keys.realize(), values.realize()
-
-    xq = xq.transpose(1, 2)
-    keys = keys.transpose(1, 2)
-    values = values.transpose(1, 2)
-    scores = xq.matmul(keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-    if mask is not None:
-      scores = scores + mask
-    scores = scores.softmax()  # this is casted to float
-    return scores.matmul(values).transpose(1, 2).reshape(bsz, seqlen, -1)
-
-  # NOTE: this is not called
-  def __call__(self, x:Tensor, start_pos:int, freqs_cis:Tensor, mask:Optional[Tensor]) -> Tensor:
-    xq, xk, xv = self.prepare_attention(x, freqs_cis)
-    output = self.inner_attention(xq, xk, xv, start_pos, mask)
-    return self.wo(output)
+    cache_k, cache_v = keys, values
+    keys, values = repeat_kv(keys, self.n_rep).realize(), repeat_kv(values, self.n_rep).realize()
+    attn = Tensor.scaled_dot_product_attention(xq.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2), mask).transpose(1, 2).reshape(bsz, seqlen, -1)
+    return self.wo(attn).realize(), cache_k.realize(), cache_v.realize()
 
 class FeedForward:
-  def __init__(self, dim, hidden_dim, multiple_of):
+  def __init__(self, dim, hidden_dim, multiple_of, linear=Linear, ffn_dim_multiplier=None):
     # TODO: what is this?
     hidden_dim = int(2 * hidden_dim / 3)
+    # custom dim factor multiplier
+    if ffn_dim_multiplier is not None:
+      hidden_dim = int(ffn_dim_multiplier * hidden_dim)
     hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-    self.w1 = Linear(dim, hidden_dim, bias=False)
-    self.w2 = Linear(hidden_dim, dim, bias=False)
-    self.w3 = Linear(dim, hidden_dim, bias=False)
+    self.w1 = linear(dim, hidden_dim, bias=False)
+    self.w2 = linear(hidden_dim, dim, bias=False)
+    self.w3 = linear(dim, hidden_dim, bias=False)
 
   def __call__(self, x:Tensor) -> Tensor:
     return self.w2(self.w1(x).silu() * self.w3(x))
 
 class TransformerBlock:
-  def __init__(self, dim, multiple_of, n_heads, norm_eps):
-    self.attention = Attention(dim, n_heads)
-    self.feed_forward = FeedForward(dim, 4*dim, multiple_of)
+  def __init__(self, dim, multiple_of, n_heads, n_kv_heads, norm_eps, linear=Linear, ffn_dim_multiplier=None):
+    self.attention = Attention(dim, n_heads, n_kv_heads, linear)
+    self.feed_forward = FeedForward(dim, 4*dim, multiple_of, linear, ffn_dim_multiplier)
     self.attention_norm = RMSNorm(dim, norm_eps)
     self.ffn_norm = RMSNorm(dim, norm_eps)
-    if getenv("JIT"):
-      self._pre = TinyJit(self.pre)
-      self._post = TinyJit(self.post)
+
+  def __call__(self, x:Tensor, cache_k:Optional[Tensor], cache_v:Optional[Tensor], start_pos:int, freqs_cis:Tensor, mask:Optional[Tensor], jit_ctx:Optional[Dict[Variable,int]]=None):
+    bsz, seqlen, _ = x.shape
+    if getenv("JIT") and mask is None:
+      assert cache_k is not None and cache_v is not None, "no cache"
+      pos = Variable("pos", 1, 1024)
+      cache_k = cache_k.reshape(cache_k.shape[0], pos, cache_k.shape[2], cache_k.shape[3])
+      cache_v = cache_v.reshape(cache_v.shape[0], pos, cache_v.shape[2], cache_v.shape[3])
+      # need this because we don't reshape back to int shape in the jitted path and we don't have the correct var_vars in cache
+      cache_k.lazydata.st.var_vals[pos] = start_pos
+      cache_v.lazydata.st.var_vals[pos] = start_pos
+
+      # get only the part of freqs_cis that we are using.
+      freqs_cis = freqs_cis.shrink(((0, freqs_cis.shape[0]), (pos, pos+seqlen), (0, freqs_cis.shape[2]), (0, freqs_cis.shape[3]), (0, freqs_cis.shape[4])))
+      freqs_cis.lazydata.st.var_vals[pos] = start_pos
     else:
-      self._pre, self._post = self.pre, self.post
+      freqs_cis = freqs_cis.shrink(((0, freqs_cis.shape[0]), (start_pos, start_pos+seqlen), (0, freqs_cis.shape[2]), (0, freqs_cis.shape[3]), (0, freqs_cis.shape[4])))
 
-  def pre(self, x:Tensor, freqs_cis:Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-    xq, xk, xv = self.attention.prepare_attention(self.attention_norm(x), freqs_cis)
-    return xq.realize(), xk.realize(), xv.realize()
-
-  def post(self, x:Tensor, output:Tensor) -> Tensor:
-    h = x + self.attention.wo(output)
-    return (h + self.feed_forward(self.ffn_norm(h))).realize()
-
-  def __call__(self, x:Tensor, start_pos:int, freqs_cis:Tensor, mask:Optional[Tensor]):
-    xq, xk, xv = self._pre(x, freqs_cis)
-    # inner_attention can't be jitted because it's dynamic based on start_pos
-    output = self.attention.inner_attention(xq, xk, xv, start_pos, mask)
-    return self._post(x, output)
+    output, cache_k, cache_v = self.attention(self.attention_norm(x), cache_k, cache_v, start_pos, freqs_cis, mask, jit_ctx=jit_ctx)
+    h = x + output
+    return (h + self.feed_forward(self.ffn_norm(h))).realize(), cache_k.realize(), cache_v.realize()
 
 class Transformer:
-  def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, max_batch_size=32, max_seq_len=1024):
-    self.layers = [TransformerBlock(dim, multiple_of, n_heads, norm_eps) for _ in range(n_layers)]
+  def __init__(self, dim, multiple_of, n_heads, n_layers, norm_eps, vocab_size, linear=Linear, max_batch_size=32, max_seq_len=1024, ffn_dim_multiplier=None, n_kv_heads=None):
+    self.layers = [TransformerBlock(dim, multiple_of, n_heads, n_kv_heads, norm_eps, linear, ffn_dim_multiplier) for _ in range(n_layers)]
+    self.kv_caches = [(None, None) for _ in range(n_layers)]
     self.norm = RMSNorm(dim, norm_eps)
-    self.tok_embeddings = {"weight": Tensor.glorot_uniform(vocab_size, dim)}
-    self.output = Linear(dim, vocab_size, bias=False)
+    self.tok_embeddings = Embedding(vocab_size, dim)
+    self.output = linear(dim, vocab_size, bias=False)
     self.freqs_cis = Tensor(precompute_freqs_cis(dim // n_heads, max_seq_len * 2))
 
-  def __call__(self, tokens:Tensor, start_pos:int):
-    _bsz, seqlen, _ = tokens.shape
-    h = tokens @ self.tok_embeddings['weight']
+    self.tok_embeddings_jitted = TinyJit(lambda x: self.tok_embeddings(x).realize())
+    self.postprocess_jitted = TinyJit(self.postprocess)
+    self.layers_jitted = [TinyJit(layer.__call__) for layer in self.layers]
 
-    # get only the part we are using. making it contiguous avoids more kernel calls
-    freqs_cis = self.freqs_cis[:, start_pos:start_pos+seqlen].contiguous().realize()
+  def postprocess(self, x, temperature:Optional[float]):
+    logits = self.output(self.norm(x))
+    if temperature is not None: return (logits[:, -1, :] / (temperature+1e-10)).softmax().flatten().realize()
+    return logits.realize()
 
-    if seqlen > 1:
-      mask = np.full((1, 1, seqlen, start_pos + seqlen), float("-inf"), dtype=np.float32)
-      mask = np.triu(mask, k=start_pos + 1)  # TODO: this is hard to do in tinygrad
-      mask = Tensor(mask)
+  def __call__(self, tokens:Tensor, start_pos:int, temperature:Optional[float]=None):
+    _bsz, seqlen = tokens.shape
+    if seqlen == 1 and getenv("JIT"):
+      pos = Variable("pos", 1, 1024)
+      freqs_cis = self.freqs_cis.shrink(((0, self.freqs_cis.shape[0]), (pos, pos+seqlen),(0, self.freqs_cis.shape[2]),(0, self.freqs_cis.shape[3]),(0, self.freqs_cis.shape[4])))
+      freqs_cis.lazydata.st.var_vals[pos] = start_pos
+      h = self.tok_embeddings_jitted(tokens)
+      for i, (layer, (cache_k, cache_v)) in enumerate(zip(self.layers_jitted, self.kv_caches)):
+        h, cache_k, cache_v = layer(h, cache_k, cache_v, start_pos=start_pos, freqs_cis=self.freqs_cis, mask=None, jit_ctx={pos: start_pos})
+        # TODO: move the kv cache into Attention, pre-allocate the cache and instead of cat, update the cache in-place
+        self.kv_caches[i] = (cache_k, cache_v)
+      return self.postprocess_jitted(h, temperature)
     else:
-      mask = None
-
-    for layer in self.layers:
-      h.realize()  # TODO: why do i need this?
-      h = layer(h, start_pos, freqs_cis, mask)
-
-    return self.output(self.norm(h)[:, -1, :])
+      freqs_cis = self.freqs_cis.shrink(((0, self.freqs_cis.shape[0]), (start_pos, start_pos+seqlen),(0, self.freqs_cis.shape[2]),(0, self.freqs_cis.shape[3]),(0, self.freqs_cis.shape[4])))
+      mask = Tensor.full((1, 1, seqlen, start_pos + seqlen), float("-inf"), dtype=dtypes.float32).triu(start_pos+1).realize()
+      h = self.tok_embeddings(tokens)
+      for i, (layer, (cache_k, cache_v)) in enumerate(zip(self.layers, self.kv_caches)):
+        # need this reshape back to int shape in conversational mode because jitted and unjitted calls share the same cache
+        if cache_k is not None and start_pos > 0:
+          cache_k = cache_k.reshape(cache_k.shape[0], start_pos, cache_k.shape[2], cache_k.shape[3])
+          cache_v = cache_v.reshape(cache_v.shape[0], start_pos, cache_v.shape[2], cache_v.shape[3])
+        h, cache_k, cache_v = layer(h, cache_k, cache_v, start_pos=start_pos, freqs_cis=self.freqs_cis, mask=mask)
+        self.kv_caches[i] = (cache_k, cache_v)
+      return self.postprocess(h, temperature)
 
 # **** files and arguments ****
 
-TOKENIZER_FILENAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../weights/LLaMA/tokenizer.model")
 VOCAB_SIZE = 32000
-
-args_small = {"dim": 512, "multiple_of": 256, "n_heads": 8, "n_layers": 8, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE}
-
-args_7B = {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
-WEIGHTS_FILENAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../weights/LLaMA/7B/consolidated.00.pth")
-
-# TODO: make this model work
-args_13B = {"dim": 5120, "multiple_of": 256, "n_heads": 40, "n_layers": 40, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE}
-WEIGHTS0_FILENAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../weights/LLaMA/13B/consolidated.00.pth")
-WEIGHTS1_FILENAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../weights/LLaMA/13B/consolidated.01.pth")
+MODEL_PARAMS = {
+  1: {
+    "7B": {
+      "args": {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE},
+      "files": 1,
+    },
+    "13B": {
+      "args": {"dim": 5120, "multiple_of": 256, "n_heads": 40, "n_layers": 40, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE},
+      "files": 2,
+    },
+    "30B": {
+      "args": {"dim": 6656, "multiple_of": 256, "n_heads": 52, "n_layers": 60, "norm_eps": 1e-06, "vocab_size": VOCAB_SIZE},
+      "files": 4,
+    },
+    "65B": {
+      "args": {"dim": 8192, "multiple_of": 256, "n_heads": 64, "n_layers": 80, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE},
+      "files": 8,
+    },
+  },
+  2: {
+    "7B": {
+      "args": {"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE},
+      "files": 1,
+    },
+    "13B": {
+      "args": {"dim": 5120, "multiple_of": 256, "n_heads": 40, "n_layers": 40, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE},
+      "files": 2,
+    },
+    "70B": {
+      "args": {"dim": 8192, "multiple_of": 4096, "ffn_dim_multiplier": 1.3, "n_heads": 64, "n_kv_heads": 8, "n_layers": 80, "norm_eps": 1e-05, "vocab_size": VOCAB_SIZE},
+      "files": 8,
+    },
+  },
+}
 
 # **** helper functions ****
+def concat_weights(models):
+  def convert(name) -> Tensor:
+    disk_tensors = [model[name] for model in models]
+    if len(disk_tensors) == 1 or len(disk_tensors[0].shape) == 1:
+      return disk_tensors[0].to(device=Device.DEFAULT)
+    axis = 1 if name.startswith('tok_embeddings.') or name.endswith('.attention.wo.weight') or name.endswith('.feed_forward.w2.weight') else 0
+    lazy_tensors = [data.to(device=Device.DEFAULT) for data in disk_tensors]
+    return lazy_tensors[0].cat(*lazy_tensors[1:], dim=axis)
+  return {name: convert(name) for name in {name: None for model in models for name in model}}
 
-def onehot_encode(toks, vocab_size=VOCAB_SIZE):
-  # this allows the embedding to work in tinygrad
-  onehot = np.zeros((1, len(toks), vocab_size), dtype=np.float32)
-  onehot[0,range(len(toks)),toks] = 1
-  return Tensor(onehot)
-
-def sample(logits, temperature):
-  if temperature < 1e-6:
-    # so close to 0 we use argmax
-    return int(logits.numpy().argmax())
+def load(fn:str):
+  if fn.endswith('.index.json'):
+    with open(fn) as fp: weight_map = json.load(fp)['weight_map']
+    parts = {n: load(Path(fn).parent / Path(n).name) for n in set(weight_map.values())}
+    return {k: parts[n][k] for k, n in weight_map.items()}
+  elif fn.endswith('.safetensors'):
+    return safe_load(fn)
   else:
-    probs = (logits / temperature).softmax()
-    probs = probs.numpy().flatten()
-    return int(np.random.choice(len(probs), p=probs))
+    return torch_load(fn)
+
+def convert_from_huggingface(weights, model):
+  keymap = {
+    'model.embed_tokens.weight': 'tok_embeddings.weight',
+    **{f'model.layers.{l}.input_layernorm.weight': f'layers.{l}.attention_norm.weight' for l in range(len(model.layers))},
+    **{f'model.layers.{l}.self_attn.{x}_proj.weight': f'layers.{l}.attention.w{x}.weight' for x in ['q', 'k', 'v', 'o'] for l in range(len(model.layers))},
+    **{f'model.layers.{l}.post_attention_layernorm.weight': f'layers.{l}.ffn_norm.weight' for l in range(len(model.layers))},
+    **{f'model.layers.{l}.mlp.{x}_proj.weight': f'layers.{l}.feed_forward.w{y}.weight' for x, y in {'gate': '1', 'down': '2', 'up': '3'}.items() for l in range(len(model.layers))},
+    'model.norm.weight': 'norm.weight',
+    'lm_head.weight': 'output.weight',
+  }
+  return {keymap[k]: v for k,v in weights.items() if '.rotary_emb.' not in k}
+
+class AbsmaxQuantizedLinear:
+  def __init__(self, in_features, out_features, bias=False):
+    assert bias == False
+    self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.int8)
+    self.scale = Tensor.ones(out_features, dtype=dtypes.half)
+
+  def __call__(self, x):
+    return x.dot(self.weight.cast(dtype=dtypes.half).T*self.scale)
+
+  @staticmethod
+  def quantize(tensors):
+    new_tensors = {}
+    for name,v in tensors.items():
+      if 'feed_forward' in name or ('attention.w') in name or name == 'output.weight':
+        scale = v.abs().max(axis=1) / 127.0
+        int8_weight = (v.T/scale).T.cast(dtype=dtypes.int8)
+        new_tensors[name] = int8_weight
+        new_tensors[name.replace('weight', 'scale')] = scale
+      else:
+        new_tensors[name] = v
+    return new_tensors
+
+class LLaMa:
+  @staticmethod
+  def build(model_path, tokenizer_path, model_gen=1, model_size="7B", quantize=False):
+    from sentencepiece import SentencePieceProcessor
+    sp_model = SentencePieceProcessor(model_file=str(tokenizer_path))
+    assert sp_model.vocab_size() == VOCAB_SIZE
+
+    params = MODEL_PARAMS[model_gen][model_size]
+    model = Transformer(**params["args"], linear=AbsmaxQuantizedLinear) if quantize else Transformer(**params["args"])
+
+    if model_path.is_dir():
+      weights = concat_weights([load(filename) for filename in [f"{model_path}/consolidated.{i:02d}.pth" for i in range(params["files"])]])
+    else:
+      weights = load(str(model_path))
+    if 'model.embed_tokens.weight' in weights:
+      weights = convert_from_huggingface(weights, model)
+
+    if quantize:
+      weights = AbsmaxQuantizedLinear.quantize(weights)
+      for _,v in weights.items(): v.realize()
+    load_state_dict(model, weights, strict=False)
+
+    return LLaMa(model, sp_model)
+
+  def __init__(self, model, tokenizer):
+    self.model = model
+    self.tokenizer = tokenizer
+
+  def greedy_until(self, prompt:str, until, max_length, temperature):
+    toks = [self.tokenizer.bos_id()] + self.tokenizer.encode(prompt)
+    start_pos = 0
+    for i in range(max_length):
+      probs = llama.model(Tensor([toks[start_pos:]]), start_pos, args.temperature).realize()
+      probs_np = probs.numpy()
+      tok = int(np.random.choice(len(probs_np), p=probs_np))
+      start_pos = len(toks)
+      toks.append(tok)
+
+      if tok == self.tokenizer.eos_id(): break
+      output = self.tokenizer.decode(toks)
+      for s in until:
+        if output.endswith(s): return output[0:-len(s)]
+    return output
 
 # **** main code ****
 
 if __name__ == "__main__":
   Tensor.no_grad = True
-
   print(f"using {Device.DEFAULT} backend")
-  from sentencepiece import SentencePieceProcessor
-  sp_model = SentencePieceProcessor(model_file=TOKENIZER_FILENAME)
-  assert sp_model.vocab_size() == VOCAB_SIZE
 
-  parser = argparse.ArgumentParser(description='Run LLaMA 7B in tinygrad', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+  parser = argparse.ArgumentParser(description='Run LLaMA in tinygrad', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
   # test: python3 examples/llama.py --prompt="Hello." --temperature=0
   # Hello. I'm a 20 year old male. I'm a student at the University of Texas at Austin. I'm a sophomore majoring in Computer Science.
+  # test: python3 examples/llama.py --gen 2 --prompt="Hello." --temperature=0
+  # Hello. I'm a 20 year old girl who is looking for a good lay in Palm Coast. I don't care whether it's at your place or not, as long as it's clean.
   parser.add_argument('--prompt', type=str, default=None, help="Phrase to start with. Without this, it goes into chatbot mode")
   parser.add_argument('--count', type=int, default=1000, help="Max number of tokens to generate")
   parser.add_argument('--personality', type=str, default="Stacy", help="Personality, can be Stacy, George, Gary, or Lexie")
@@ -215,71 +330,13 @@ if __name__ == "__main__":
   parser.add_argument('--temperature', type=float, default=0.7, help="Temperature in the softmax")
   parser.add_argument('--timing', action='store_true', help="Print timing per token")
   parser.add_argument('--profile', action='store_true', help="Output profile data to out.prof")
-  parser.add_argument('--large', action='store_true', help="Use the 13B model instead of the 7B one")
+  parser.add_argument('--size', type=str, default="7B", help="Size of model to use [7B, 13B, 30B, 65B] for Gen 1, [7B, 13B, 70B] for Gen 2")
+  parser.add_argument('--gen', type=int, default="1", help="Generation of the model to use [1, 2]")
+  parser.add_argument('--quantize', action='store_true', help="Quantize the weights to int8 in memory")
+  parser.add_argument('--model', type=Path, default=None, help="Folder with the original weights to load, or single .index.json, .safetensors or .bin file")
+
   args = parser.parse_args()
   chatbot = args.prompt == None
-
-  # load model (you have to find the weights yourself)
-  from extra.utils import fake_torch_load_zipped, get_child
-
-  if args.large:
-    raise RuntimeError("large model is broken")
-    model = Transformer(**args_13B)
-    with Timing("loaded weights in ", lambda et_ns: f", {GlobalCounters.mem_used/1e9:.2f} GB loaded at {GlobalCounters.mem_used/et_ns:.2f} GB/s"):
-      weights0 = fake_torch_load_zipped(open(WEIGHTS0_FILENAME, "rb"), load_weights=getenv("WEIGHTS", 1), base_name="consolidated.00")
-      weights1 = fake_torch_load_zipped(open(WEIGHTS1_FILENAME, "rb"), load_weights=getenv("WEIGHTS", 1), base_name="consolidated.01")
-    # eww, this makes a copy
-    print("concatenating weights")
-    from tqdm import tqdm
-    for k,v in (t := tqdm(weights0.items())):
-      assert GlobalCounters.mem_used/1e9 < 28, "used over 28 GB"
-      t.set_description(f"ram used: {GlobalCounters.mem_used/1e9:5.2f} GB")
-      if 'rope.freqs' in k: continue  # no rope today
-      mv = get_child(model, k)
-      w0, w1 = v, weights1[k]
-
-      # if the weight is copied across models, it's simple
-      # TODO: assert they are the same
-      if w0.shape == mv.shape:
-        mv.lazydata.realized = w0
-        w0._buf = None
-        continue
-
-      # we have to concatenate them, create tensors
-      w0t = Tensor.empty(*w0.shape)
-      w1t = Tensor.empty(*w1.shape)
-      w0t.lazydata.realized = w0
-      w1t.lazydata.realized = w1
-
-      # terrible hacks. force create the output buffer as float16
-      mv.lazydata.realized = Device._buffers[Device.DEFAULT].empty(mv.shape, dtype=w0.dtype)
-
-      if w0.shape[0] != mv.shape[0]: mv.assign(w0t.cat(w1t, dim=0))
-      elif w0.shape[1] != mv.shape[1]: mv.assign(w0t.cat(w1t, dim=1))
-      else: raise RuntimeError("what axis mismatch?")
-      mv.realize()
-
-      # rug the small tensor pieces
-      w0._buf = None
-      w1._buf = None
-
-    del weights0
-    del weights1
-  else:
-    model = Transformer(**args_7B)
-    with Timing("loaded weights in ", lambda et_ns: f", {GlobalCounters.mem_used/1e9:.2f} GB loaded at {GlobalCounters.mem_used/et_ns:.2f} GB/s"):
-      weights = fake_torch_load_zipped(open(WEIGHTS_FILENAME, "rb"), load_weights=getenv("WEIGHTS", 1), base_name="consolidated")
-
-    #from tinygrad.nn.optim import get_state_dict
-    #state_dict = get_state_dict(model)
-
-    # assign weights (should be free)
-    for k,v in weights.items():
-      if '.inner_attention.rope.freqs' in k: continue  # no rope today
-      #state_dict[k].assign(v).realize()
-      get_child(model, k).assign(v).realize()
-
-    del weights
 
   # *** prompt engineers work here ****
 
@@ -370,21 +427,28 @@ After you are done speaking, output [EOS]. You are not Chad.
 
   # *** prompt engineers stop here ****
 
+
+  LLAMA_SUFFIX = {1: "", 2: "-2"}[args.gen]
+  MODEL_PATH = args.model or Path(__file__).parents[1] / f"weights/LLaMA{LLAMA_SUFFIX}/{args.size}"
+  TOKENIZER_PATH = (MODEL_PATH if MODEL_PATH.is_dir() else MODEL_PATH.parent) / "tokenizer.model"
+  print(f"using LLaMA{LLAMA_SUFFIX}-{args.size} model")
+  llama = LLaMa.build(MODEL_PATH, TOKENIZER_PATH, model_gen=args.gen, model_size=args.size, quantize=args.quantize)
+
   if chatbot:
     # encode pre prompt
-    toks = [sp_model.bos_id()] + sp_model.encode(pre_prompt)
+    toks = [llama.tokenizer.bos_id()] + llama.tokenizer.encode(pre_prompt)
 
     print(f"Preparing KV cache for chatbot with personality {args.personality}...")
     with Timing():
-      model(onehot_encode(toks), 0).realize()  # NOTE: output logits are not used
+      llama.model(Tensor([toks]), 0, args.temperature).realize()  # NOTE: output logits are not used
     start_pos = len(toks)
   else:
     # non chat bot mode
-    toks = [sp_model.bos_id()] + sp_model.encode(args.prompt)
+    toks = [llama.tokenizer.bos_id()] + llama.tokenizer.encode(args.prompt)
     start_pos = 0
 
   # print prompt
-  outputted = sp_model.decode(toks)
+  outputted = llama.tokenizer.decode(toks)
   sys.stdout.write(outputted)
   sys.stdout.flush()
 
@@ -399,21 +463,25 @@ After you are done speaking, output [EOS]. You are not Chad.
       user_prompt = user_delim + input(user_delim) + "\n"
       outputted += user_prompt
 
-    new_toks = [sp_model.bos_id()] + sp_model.encode(outputted)
+    new_toks = [llama.tokenizer.bos_id()] + llama.tokenizer.encode(outputted)
     assert toks == new_toks[:len(toks)]
     toks = new_toks
-    assert outputted == sp_model.decode(toks)
+    assert outputted == llama.tokenizer.decode(toks)
 
     last_break = len(outputted)
     for i in range(args.count):
+      GlobalCounters.reset()
       if args.profile and i == 2: profiler.enable()
 
       if args.timing: print("")
       st = GlobalCounters.time_sum_s
-      with Timing("ran model in ", on_exit=(lambda et: f", {(GlobalCounters.time_sum_s-st)*1e3:.2f} ms on GPU") if DEBUG else None, enabled=args.timing):
-        logits = model(onehot_encode(toks[start_pos:]), start_pos).realize()
+      with Timing("ran model in ", on_exit=(lambda et: f", {(GlobalCounters.time_sum_s-st)*1e3:.2f} ms on GPU"+
+                  f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
+                  f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s") if DEBUG else None, enabled=args.timing):
+        probs = llama.model(Tensor([toks[start_pos:]]), start_pos, args.temperature).realize()
       with Timing("sync in ", enabled=args.timing):
-        tok = sample(logits, args.temperature)
+        probs_np = probs.numpy()
+        tok = int(np.random.choice(len(probs_np), p=probs_np))
 
       # use the kv cache
       start_pos = len(toks)
@@ -422,7 +490,7 @@ After you are done speaking, output [EOS]. You are not Chad.
       toks.append(tok)
 
       # TODO: this is a hack to deal with spaces. i think the decode is fast though, so who cares?
-      cur = sp_model.decode(toks)
+      cur = llama.tokenizer.decode(toks)
       sys.stdout.write(cur[len(outputted):])
       sys.stdout.flush()
       outputted = cur

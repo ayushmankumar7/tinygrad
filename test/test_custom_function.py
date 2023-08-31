@@ -8,31 +8,33 @@ from tinygrad.helpers import prod, dtypes
 
 # *** first, we implement the atan2 op at the lowest level ***
 # `atan2_gpu` for GPUBuffers and `atan2_cpu` for CPUBuffers
+from tinygrad.lazy import LazyBuffer, create_lazybuffer, Device
+from tinygrad.ops import ASTRunner
+from tinygrad.shape.shapetracker import ShapeTracker
+import pytest
 
-from tinygrad.ops import ASTRunner, CompiledBuffer
-from tinygrad.runtime.ops_cpu import CPUBuffer
+pytestmark = pytest.mark.webgpu
 
 # we don't always have GPU support, so the type signature is the abstract CompiledBuffer instead of GPUBuffer
-def atan2_gpu(a:CompiledBuffer, b:CompiledBuffer) -> CompiledBuffer:
-  from tinygrad.runtime.ops_gpu import GPUBuffer
-  assert type(a) == GPUBuffer and type(b) == GPUBuffer, "gpu function requires GPUBuffers"
+def atan2_gpu(ret:LazyBuffer, a:LazyBuffer, b:LazyBuffer):
+  assert a.device == "GPU" and b.device == "GPU", "gpu function requires GPUBuffers"
   assert a.dtype == b.dtype and a.dtype == dtypes.float32, "gpu function only supports float32"
-  ret = GPUBuffer(a.shape)
-  ASTRunner("atan2", """
-    __kernel void atan2(global float *c, global float *a, global float *b) {
+  ret.realized = Device[ret.device].buffer(prod(ret.shape), ret.dtype)
+  ASTRunner("atan2_gpu", """
+    __kernel void atan2_gpu(global float *c, global float *a, global float *b) {
       int idx = get_global_id(0);
       c[idx] = atan2(a[idx], b[idx]);
-    }""", global_size=[prod(ret.shape)]).build(GPUBuffer.spec.runtime).exec([ret, a.contiguous(), b.contiguous()])
-  return ret
+    }""", global_size=[prod(ret.shape)]).build(Device[ret.device].runtime).exec([ret, a, b])
+  return ret.realized
 
-def atan2_cpu(a:CPUBuffer, b:CPUBuffer) -> CPUBuffer:
-  return CPUBuffer(np.arctan2(a._buf, b._buf))
+def atan2_cpu(ret:LazyBuffer, a:LazyBuffer, b:LazyBuffer):
+  return Device[ret.device].from_underlying(np.arctan2(a.realized._buf, b.realized._buf))
 
 # *** second, we write the ATan2 mlop ***
 # NOTE: The derivative of atan2 doesn't need a custom op! https://www.liquisearch.com/atan2/derivative
 # In general, it is also optional to write a backward function, just your backward pass won't work without it
 
-from tinygrad.ops import ASTRunner, LazyOp, LoadOps, BinaryOps, UnaryOps
+from tinygrad.ops import LazyOp, LoadOps, BinaryOps, UnaryOps
 from tinygrad.lazy import LazyBuffer
 from tinygrad.tensor import Function
 
@@ -40,16 +42,16 @@ class ATan2(Function):
   def forward(self, a:LazyBuffer, b:LazyBuffer) -> LazyBuffer:
     assert prod(a.shape) == prod(b.shape) and a.device == b.device, "shape or device mismatch"
     self.a, self.b = a, b
-    ast = LazyOp(LoadOps.CUSTOM, (a, b), {"GPU": atan2_gpu, "CPU": atan2_cpu}[a.device])
-    return LazyBuffer(a.device, a.shape, LoadOps, ast, max(a.dtype, b.dtype))
+    ast = LazyOp(LoadOps.CUSTOM, (a.contiguous(), b.contiguous()), {"GPU": atan2_gpu, "CPU": atan2_cpu}[a.device])
+    return create_lazybuffer(a.device, ShapeTracker(a.shape), LoadOps, ast, max(a.dtype, b.dtype))
   def backward(self, grad_output:LazyBuffer) -> Tuple[Optional[LazyBuffer], Optional[LazyBuffer]]:
-    denom = (self.a.binary_op(BinaryOps.MUL, self.a)).binary_op(BinaryOps.ADD, self.b.binary_op(BinaryOps.MUL, self.b))
-    return grad_output.binary_op(BinaryOps.MUL, self.b.binary_op(BinaryOps.DIV, denom)) if self.needs_input_grad[0] else None, \
-           grad_output.binary_op(BinaryOps.MUL, self.a.unary_op(UnaryOps.NEG).binary_op(BinaryOps.DIV, denom)) if self.needs_input_grad[1] else None
+    denom = (self.a.e(BinaryOps.MUL, self.a)).e(BinaryOps.ADD, self.b.e(BinaryOps.MUL, self.b))
+    return grad_output.e(BinaryOps.MUL, self.b.e(BinaryOps.DIV, denom)) if self.needs_input_grad[0] else None, \
+           grad_output.e(BinaryOps.MUL, self.a.const(0).e(BinaryOps.SUB, self.a).e(BinaryOps.DIV, denom)) if self.needs_input_grad[1] else None
 
 # *** third, we use our lovely new mlop in some tests ***
 
-from tinygrad.tensor import Tensor, Device
+from tinygrad.tensor import Tensor
 
 @unittest.skipUnless(Device.DEFAULT in ["CPU", "GPU"], "atan2 is only implemented for CPU and GPU")
 class TestCustomFunction(unittest.TestCase):

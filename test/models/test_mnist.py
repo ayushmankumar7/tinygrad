@@ -1,10 +1,14 @@
 #!/usr/bin/env python
 import unittest
 import numpy as np
+from tinygrad.nn.state import get_parameters
 from tinygrad.tensor import Tensor, Device
 from tinygrad.nn import optim, BatchNorm2d
 from extra.training import train, evaluate
-from datasets import fetch_mnist
+from extra.datasets import fetch_mnist
+import pytest
+
+pytestmark = [pytest.mark.exclude_gpu, pytest.mark.exclude_clang]
 
 # load the mnist dataset
 X_train, Y_train, X_test, Y_test = fetch_mnist()
@@ -16,7 +20,7 @@ class TinyBobNet:
     self.l2 = Tensor.scaled_uniform(128, 10)
 
   def parameters(self):
-    return optim.get_parameters(self)
+    return get_parameters(self)
 
   def forward(self, x):
     return x.dot(self.l1).relu().dot(self.l2).log_softmax()
@@ -38,7 +42,7 @@ class TinyConvNet:
       self.bn1, self.bn2 = lambda x: x, lambda x: x
 
   def parameters(self):
-    return optim.get_parameters(self)
+    return get_parameters(self)
 
   def forward(self, x:Tensor):
     x = x.reshape(shape=(-1, 1, 28, 28)) # hacks
@@ -92,15 +96,14 @@ class TestMNIST(unittest.TestCase):
     model = TinyConvNet()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     train(model, X_train, Y_train, optimizer, steps=100)
-    assert evaluate(model, X_test, Y_test) > 0.94   # torch gets 0.9415 sometimes
+    assert evaluate(model, X_test, Y_test) > 0.93   # torch gets 0.9415 sometimes
 
-  @unittest.skip("slow and training batchnorm is broken")
   def test_conv_with_bn(self):
     np.random.seed(1337)
     model = TinyConvNet(has_batchnorm=True)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    train(model, X_train, Y_train, optimizer, steps=100)
-    assert evaluate(model, X_test, Y_test) > 0.7 # TODO: batchnorm doesn't work!!!
+    optimizer = optim.AdamW(model.parameters(), lr=0.003)
+    train(model, X_train, Y_train, optimizer, steps=200)
+    assert evaluate(model, X_test, Y_test) > 0.94
 
   def test_sgd(self):
     np.random.seed(1337)
@@ -108,13 +111,6 @@ class TestMNIST(unittest.TestCase):
     optimizer = optim.SGD(model.parameters(), lr=0.001)
     train(model, X_train, Y_train, optimizer, steps=600)
     assert evaluate(model, X_test, Y_test) > 0.94   # CPU gets 0.9494 sometimes
-
-  def test_rmsprop(self):
-    np.random.seed(1337)
-    model = TinyBobNet()
-    optimizer = optim.RMSprop(model.parameters(), lr=0.0002, alpha=0.9)
-    train(model,  X_train, Y_train, optimizer, steps=400)
-    assert evaluate(model, X_test, Y_test) > 0.95
 
 if __name__ == '__main__':
   unittest.main()

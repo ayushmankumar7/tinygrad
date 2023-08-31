@@ -13,7 +13,7 @@ this documentation will help with entry points and understanding the abstraction
 # %%
 # == Boilerplate imports for typing ==
 from __future__ import annotations
-from typing import Optional, Tuple, Union, Any, Dict, Callable, Type, List
+from typing import Optional, Tuple, Union, Any, Dict, Callable, Type, List, ClassVar
 from enum import Enum, auto
 from abc import ABC
 
@@ -22,7 +22,7 @@ from abc import ABC
 # let's trace an addition down through the layers of abstraction.
 
 # we will be using the clang backend
-from tinygrad.lazy import Device
+from tinygrad.ops import Device
 Device.DEFAULT = "CLANG"
 
 # first, 2+3 as a Tensor, the highest level
@@ -77,13 +77,19 @@ class LazyBuffer:
   shape: Tuple[int, ...]
   dtype: DType
 
+  # a ShapeTracker is used to track things like reshapes and permutes
+  # all MovementOps are zero copy in tinygrad!
+  # the ShapeTracker specifies how the data in the RawBuffer matches to the shape
+  # we'll come back to this later
+  st: ShapeTracker
+
+  # if the LazyBuffer is realized, it has a RawBuffer
+  # we will come back to RawBuffers later
+  realized: Optional[RawBuffer]
+
   # if the lazybuffer is unrealized, it has a LazyOp
   # this LazyOp describes the computation needed to realize this LazyBuffer
   op: Optional[LazyOp]
-
-  # if the LazyBuffer is realized, it has a DeviceBuffer
-  # we will come back to DeviceBuffers later, first we'll explore the LazyOp
-  realized: Optional[DeviceBuffer]
 
 # LazyOp (in tinygrad/ops.py, code 4/10)
 # in a tree they form an Abstract Syntax Tree for a single GPU kernel
@@ -92,16 +98,17 @@ class LazyOp:
   src: Tuple[Union[LazyOp, LazyBuffer], ...]   # the sources
   arg: Optional[Any] = None                    # and an optional static argument
 
-# there's currently 20 Ops you have to implement for an accelerator.
-class UnaryOps(Enum):    NOOP = auto(); EXP = auto(); LOG = auto(); NEG = auto(); NOT = auto()
-class BinaryOps(Enum):   ADD = auto();  SUB = auto(); MUL = auto(); DIV = auto(); POW = auto(); CMPEQ = auto(); MAX = auto()
+# there's currently 28 Ops you have to implement for an accelerator.
+class UnaryOps(Enum):    NOOP = auto(); EXP2 = auto(); LOG2 = auto(); CAST = auto(); SIN = auto();   SQRT = auto()
+class BinaryOps(Enum):   ADD = auto();  SUB = auto();  MUL = auto();  DIV = auto();  CMPLT = auto(); MAX = auto()
 class ReduceOps(Enum):   SUM = auto();  MAX = auto()
 class MovementOps(Enum): RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); SHRINK = auto(); STRIDE = auto()
-class LoadOps(Enum):     FROMCPU = auto()
+class TernaryOps(Enum):  MULACC = auto(); WHERE = auto()
+class LoadOps(Enum):     EMPTY = auto(); RAND = auto(); CONST = auto(); FROM = auto(); CONTIGUOUS = auto(); CUSTOM = auto()
 # NOTE: if you have a CompiledBuffer(DeviceBuffer)
 #       you do not need to implement the MovementOps
 #       as they are handled by the ShapeTracker(in tinygrad/shape/shapetracker.py, code 7/10)
-Op = Union[UnaryOps, BinaryOps, ReduceOps, MovementOps, LoadOps]
+Op = Union[UnaryOps, BinaryOps, ReduceOps, MovementOps, TernaryOps, LoadOps]
 
 # most of tinygrad/lazy.py is concerned with fusing Ops into LazyOps ASTs that map to GPUKernels
 # it's beyond the scope of this tutorial, but you can read the file if interested
@@ -124,94 +131,48 @@ assert lazyop.op == BinaryOps.ADD
 assert len(lazyop.src) == 2
 
 # the first source is the 2, it comes from the CPU
-# the source is a LazyBuffer, since FROMCPU cannot be folded into LazyOp ASTs
+# the source is a LazyBuffer that is a "CPU" Tensor
 # again, a LazyOp AST is like a GPU kernel. you have to copy the data on the device first
-print(lazyop.src[0].op)
-assert lazyop.src[0].op.op == LoadOps.FROMCPU
-assert lazyop.src[0].op.arg[0] == [2], "the arg of the FROMCPU LazyOP is the [2.]"
+assert lazyop.src[0].op.op == LoadOps.FROM
+assert lazyop.src[0].op.src[0].device == "CPU"
+assert lazyop.src[0].op.src[0].realized._buf[0] == 2, "the src of the FROM LazyOP is a LazyBuffer on the CPU holding [2.]"
 assert result.lazydata.realized is None, "the LazyBuffer is not realized yet"
 
 # now we realize the LazyBuffer
 result.lazydata.realize()
 assert result.lazydata.realized is not None, "the LazyBuffer is realized!"
 # this brings us nicely to DeviceBuffer, of which the realized ClangBuffer is a subclass
-assert 'ClangBuffer' in str(type(result.lazydata.realized))
+assert 'RawMallocBuffer' in str(type(result.lazydata.realized))
 # getting ahead of ourselves, but we can copy the DeviceBuffer toCPU
 assert result.lazydata.realized.toCPU()[0] == 5, "when put in numpy with toCPU, it's 5"
 
 # %%
-# == DeviceBuffer (in tinygrad/ops.py, code 4/10) ==
+# == Union[Interpreted, Compiled] (in tinygrad/ops.py, code 5/10) ==
 
-# DeviceBuffer is an abstract class to be implemented for each Device backend
-class DeviceBuffer(ABC):
-  # these two are straightforward.
-  # unlike LazyBuffer, there's no need for device, since that's contained in the concrete type
-  shape: Tuple[int, ...]
-  dtype: DType
+# Now you have a choice, you can either write a "Interpreted" backend or "Compiled" backend
 
-  # this is the magic method that "fills" a DeviceBuffer and does all the math in tinygrad
-  # NOTE: fromCPU no longer exists here, it's just a one LoadOps AST, LoadOps.FROMCPU
-  def exec_ast(self, ast:LazyOp): raise NotImplementedError("must be implemented")
+# Interpreted backends are very simple (example: CPU and TORCH)
+class Interpreted:
+  # they have a backing RawBuffer
+  buffer: Type[RawBuffer]
 
-  # however, toCPU still exists. it will raise a RuntimeException if exec_ast has never been called
-  # it copies out the underlying to the CPU, and will do any sync operations
-  def toCPU(self) -> np.ndarray: raise NotImplementedError("must be implemented")
+  # and they have a lookup table to functions for the Ops
+  fxn_for_op: Dict[Op, Callable] = {
+    UnaryOps.EXP2: lambda x: np.exp2(x),
+    BinaryOps.ADD: lambda x,y: x+y}
 
-# DeviceBuffers come in two flavors, InterpretedBuffer and CompiledBuffer
-# InterpretedBuffers are a lot simpler than CompiledBuffers
-# they are used to implement the CPU(numpy) and TORCH(torch) backends
-# it's worth reading CPUBuffer (in tinygrad/runtime/ops_cpu.py, code 8/10)
-import numpy as np
-import torch
-class InterpretedBuffer(DeviceBuffer):
-  # this is where the data actually lives
-  # finally some classes you recognize!
-  _buf: Union[np.ndarray, torch.Tensor]
+# Compiled backends take a little more (example: GPU and LLVM)
+class Compiled:
+  # they also have a backing RawBuffer
+  buffer: Type[RawBuffer]
 
-  # the compute itself is defined here. these functions are called with _buf
-  # here's a UnaryOp and BinaryOp from CPUBuffer(InterpretedBuffer)
-  fxn_for_op: Dict[Op, Callable] = {UnaryOps.EXP: lambda x: np.exp(x), BinaryOps.ADD: lambda x,y: x+y}
+  # a code generator, which compiles the AST
+  codegen: Type[Linearizer]
 
-  # NOTE: exec_ast should not need to be overridden!
-  # The actual method lives in tinygrad/ops.py
-  # it walks the LazyOp tree and calls fxn_for_op as appropriate
-
-# ********** NOTE: for the CPU and TORCH backends, we are done and you can stop reading here **********
-
-# %%
-# == CompiledBuffer (in tinygrad/ops.py, code 4/10) ==
-
-# however, all the magic of tinygrad will come from CompiledBuffer
-# this is used for the GPU(opencl), CUDA, METAL, CLANG, and LLVM backends
-class CompiledBuffer(DeviceBuffer):
-  # this is where the data actually lives, same as InterpretedBuffer
-  # a RawBuffer is just raw (typed) memory on the Device in question
-  _buf: RawBuffer
-
-  # introducing...ShapeTracker! all MovementOps are zero copy in tinygrad
-  # the ShapeTracker specifies how the data in the RawBuffer matches to the shape
-  # we'll come back to this later
-  st: ShapeTracker
-
-  # NOTE: exec_ast should not need to be overridden!
-  # instead you need three classes, explained below
-  raw_buffer: Type[RawBuffer]
+  # and a runtime, which runs the generated code
   runtime: Type[Runtime]
-  codegen: Type[ASTKernel]
 
-# for completeness, we include RawBuffer. it's very boring and exactly what you expect
-class RawBuffer(ABC):
-  # create an empty rawbuffer that holds `size` elements of type `dtype`
-  def __init__(self, size:int, dtype:DType): raise NotImplementedError("must be implemented")
-
-  # fromCPU is classmethod that creates a RawBuffer, it's a classmethod since some runtimes are 0 copy
-  @classmethod
-  def fromCPU(cls:RawBuffer, x:np.ndarray) -> RawBuffer: raise NotImplementedError("must be implemented")
-
-  # toCPU converts the RawBuffer to a numpy array with shape (size,). many backends are 0 copy here
-  def toCPU(self) -> np.ndarray: raise NotImplementedError("must be implemented")
-
-# Runtime is what actually runs the kernels
+# Runtime is what actually runs the kernels for a compiled backend
 class Runtime(ABC):
   # `name` is the name of the function, and `prg` is the code
   # the constructor compiles the code
@@ -220,12 +181,38 @@ class Runtime(ABC):
   def __call__(self, global_size:Optional[List[int]], local_size:Optional[List[int]], *bufs:List[RawBuffer]): pass
 
 # %%
+# == RawBuffer (in tinygrad/runtime/lib.py, code 5/10) ==
+import numpy as np
+
+# RawBuffer is where the data is actually held. it's pretty close to just memory
+class RawBuffer(ABC):
+  # create an empty rawbuffer that holds `size` elements of type `dtype`
+  # `buf` is an opaque container class
+  def __init__(self, size:int, dtype:DType, buf:Any): raise NotImplementedError("must be implemented")
+
+  # fromCPU is classmethod that creates a RawBuffer, it's a classmethod since some runtimes are 0 copy
+  @classmethod
+  def fromCPU(cls:RawBuffer, x:np.ndarray) -> RawBuffer: raise NotImplementedError("must be implemented")
+
+  # toCPU converts the RawBuffer to a numpy array with shape (size,). many backends are 0 copy here
+  def toCPU(self) -> np.ndarray: raise NotImplementedError("must be implemented")
+
+# RawNumpyBuffer is a RawBuffer example for numpy. It's very simple
+class RawNumpyBuffer(RawBuffer):
+  # NOTE: the "np.ndarray" is stored in the opaque container
+  def __init__(self, buf:np.ndarray):
+    super().__init__(buf.size, dtypes.from_np(buf.dtype), buf)
+  @classmethod
+  def fromCPU(cls, x): return cls(x)
+  def toCPU(self): return self._buf
+
+# %%
 # == Example: 2+3 in raw clang ==
 
 # RawMallocBuffer is the simplest concrete version of RawBuffer (in tinygrad/ops.py)
 # it's used for the CLANG and LLVM backends
 # it's just malloc(size * dtype.itemsize)
-from tinygrad.ops import RawMallocBuffer
+from tinygrad.runtime.lib import RawMallocBuffer
 
 # ClangProgram is the simplest runtime (in tinygrad/runtime/ops_clang.py, code 7/10)
 # __init__ calls clang, and __call__ calls the function in the *.so outputted by clang
@@ -242,51 +229,84 @@ input_a, input_b = RawMallocBuffer.fromCPU(numpy_a), RawMallocBuffer.fromCPU(num
 output = RawMallocBuffer(1, dtypes.float32)
 
 # compile the program, run it, and 2+3 does indeed equal 5
-program = ClangProgram("add", "void add(float *a, float *b, float *c) { *a = *b + *c; }")
+program = ClangProgram("add", f"void add(float *a, float *b, float *c) {{ *a = *b + *c; }}")
 program(None, None, output, input_a, input_b)  # NOTE: the None are for global_size and local_size
 print(output.toCPU())
 assert output.toCPU()[0] == 5, "it's still 5"
 np.testing.assert_allclose(output.toCPU(), numpy_a+numpy_b)
 
 # %%
-# == ASTKernel (in tinygrad/codegen/ast.py, code 2/10) ==
+# == Linearizer (in tinygrad/codegen/linearizer.py, code 4/10) ==
 
-# but we are nowhere near done!
-# we wrote the code above by hand
-# we need the LazyOp ASTs to be automatically turned into code
-# the current class looks roughly like this, but this will change and we will update the docs
-# this stuff is in the terrible 528 lines of (tinygrad/codegen/*, code 2/10 aka turd quality)
-class ASTKernel:
+# in the above example, we wrote the code by hand
+# normally while using tinygrad you don't do that
+# the first step of transforming an AST into code is to "linearize" it, think like toposort on the AST
+# for that, we use the Linearizer, which turns an AST into a list of (linear) UOps
+
+class UOps(Enum): LOOP = auto(); DEFINE_LOCAL = auto(); LOAD = auto(); ALU = auto(); CONST = auto(); ENDLOOP = auto(); STORE = auto();
+
+class Token:
+  name: str
+
+class UOp:
+  uop: UOps
+  out: Optional[Token]
+  vin: List[Token]
+  arg: Any
+
+class Linearizer:
   # create the kernel with the AST
   # NOTE: the AST contains the CompiledBuffers themselves as the root nodes. this will change
   def __init__(self, ast:LazyOp): pass
-  def codegen(self) -> ASTRunner: pass
+  def process(self): pass
+  def linearize(self): pass
 
-# we return a class that runs code on CompiledBuffers
-class ASTRunner:  # (from tinygrad/ops.py)
-  def __init__(self, name, prg, global_size:Optional[List[int]], local_size:Optional[List[int]]): pass
-  def build(self, runtime:Runtime): pass
-  def exec(self, bufs:List[CompiledBuffer]): pass
+  # when linearize is run, it fills in this list
+  uops: List[UOp]
 
-# that hides a lot of complexity that will be refactored, but that's the basic idea of code generation
+from tinygrad.tensor import Tensor
+from tinygrad.helpers import prod
+result = Tensor(2).realize() + Tensor(3).realize()
+result.lazydata.realized = Device[Device.DEFAULT].buffer(prod(result.shape), result.dtype)
+
+# use the real Linearizer to linearize 2+3
+from tinygrad.codegen.linearizer import Linearizer, LinearizerOptions
+linearizer = Linearizer(result.lazydata.op, result.lazydata, LinearizerOptions())
+linearizer.linearize()
+
+# print the uops
+for uop in linearizer.uops: print(uop)
+
+# output:
+"""
+UOps.DEFINE_GLOBAL  :                           []                               ('data0', dtypes.float)
+UOps.LOOP           :                           []                               ([], 'global')
+UOps.LOOP           :                           []                               ([], 'local')
+UOps.LOAD           : <acc1_0>                  []                               ConstOp(value=2.0, valid=<1>, invalid_value=0.0)
+UOps.LOAD           : <acc2_0>                  []                               ConstOp(value=3.0, valid=<1>, invalid_value=0.0)
+UOps.ALU            : <alu0>                    [<acc1_0>, <acc2_0>]             BinaryOps.ADD
+UOps.STORE          :                           [<alu0>]                         MemOp(name='data0', idx=<0>, local=False, memory_dtype=dtypes.float, valid=<1>, invalid_value=0.0)
+UOps.ENDLOOP        :                           []                               ([], 'global+local')
+"""
 
 # %%
 # == Example: 2+3 autogenerated clang code ==
+# to generate clang code, the Linearizer is wrapped with CStyleCodegen
+# here, we have an example where we fetch the generated code from the JIT
 
 from tinygrad.tensor import Tensor
-result = Tensor([2]) + Tensor([3])
+result = Tensor(2) + Tensor(3)
 
 # we have a global cache used by the JIT
 # from there, we can see the generated clang code
-from tinygrad.helpers import GlobalCounters
-GlobalCounters.cache = []    # enables the cache
+from tinygrad.jit import CacheCollector
+CacheCollector.start()       # enables the cache
 result.realize()             # create the program and runs it
-cache_saved = GlobalCounters.cache
-GlobalCounters.cache = None  # disable the cache
+cache_saved = CacheCollector.finish()  # disable the cache
 
 # there's one ASTRunner in the cache
 assert len(cache_saved) == 1
-prg, bufs = cache_saved[0]
+prg, bufs, _ = cache_saved[0]
 
 # print the C Program :)
 print(prg.prg)

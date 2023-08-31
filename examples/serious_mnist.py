@@ -2,12 +2,13 @@
 #inspired by https://github.com/Matuzas77/MNIST-0.17/blob/master/MNIST_final_solution.ipynb
 import sys
 import numpy as np
+from tinygrad.nn.state import get_parameters
 from tinygrad.tensor import Tensor
 from tinygrad.nn import BatchNorm2d, optim
 from tinygrad.helpers import getenv
-from datasets import fetch_mnist
+from extra.datasets import fetch_mnist
 from extra.augment import augment_img
-from extra.training import train, evaluate, sparse_categorical_crossentropy
+from extra.training import train, evaluate
 GPU = getenv("GPU")
 QUICK = getenv("QUICK")
 DEBUG = getenv("DEBUG")
@@ -57,7 +58,7 @@ class BigConvNet:
 
   def parameters(self):
     if DEBUG: #keeping this for a moment
-      pars = [par for par in optim.get_parameters(self) if par.requires_grad]
+      pars = [par for par in get_parameters(self) if par.requires_grad]
       no_pars = 0
       for par in pars:
         print(par.shape)
@@ -65,20 +66,20 @@ class BigConvNet:
       print('no of parameters', no_pars)
       return pars
     else:
-      return optim.get_parameters(self)
+      return get_parameters(self)
 
   def save(self, filename):
     with open(filename+'.npy', 'wb') as f:
-      for par in optim.get_parameters(self):
+      for par in get_parameters(self):
         #if par.requires_grad:
-        np.save(f, par.cpu().numpy())
+        np.save(f, par.numpy())
 
   def load(self, filename):
     with open(filename+'.npy', 'rb') as f:
-      for par in optim.get_parameters(self):
+      for par in get_parameters(self):
         #if par.requires_grad:
         try:
-          par.cpu().numpy()[:] = np.load(f)
+          par.numpy()[:] = np.load(f)
           if GPU:
             par.gpu()
         except:
@@ -92,7 +93,7 @@ class BigConvNet:
     x1 = x.avg_pool2d(kernel_size=(14,14)).reshape(shape=(-1,128)) #global
     x2 = x.max_pool2d(kernel_size=(14,14)).reshape(shape=(-1,128)) #global
     xo = x1.dot(self.weight1) + x2.dot(self.weight2)
-    return xo.log_softmax()
+    return xo
 
 
 if __name__ == "__main__":
@@ -101,7 +102,7 @@ if __name__ == "__main__":
   BS = 32
 
   lmbd = 0.00025
-  lossfn = lambda out,y: sparse_categorical_crossentropy(out, y) + lmbd*(model.weight1.abs() + model.weight2.abs()).sum()
+  lossfn = lambda out,y: out.sparse_categorical_crossentropy(y) + lmbd*(model.weight1.abs() + model.weight2.abs()).sum()
   X_train, Y_train, X_test, Y_test = fetch_mnist()
   X_train = X_train.reshape(-1, 28, 28).astype(np.uint8)
   X_test = X_test.reshape(-1, 28, 28).astype(np.uint8)
@@ -122,7 +123,7 @@ if __name__ == "__main__":
       print('could not load weights "'+sys.argv[1]+'".')
 
   if GPU:
-    params = optim.get_parameters(model)
+    params = get_parameters(model)
     [x.gpu_() for x in params]
 
   for lr, epochs in zip(lrs, epochss):

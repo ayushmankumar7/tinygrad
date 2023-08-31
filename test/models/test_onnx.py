@@ -5,9 +5,13 @@ import io
 import unittest
 import numpy as np
 import onnx
-from extra.utils import fetch
+from extra.utils import fetch, temp
 from extra.onnx import get_run_onnx
 from tinygrad.tensor import Tensor
+from tinygrad.helpers import CI
+import pytest
+
+pytestmark = [pytest.mark.exclude_gpu, pytest.mark.exclude_clang]
 
 def run_onnx_torch(onnx_model, inputs):
   import torch
@@ -17,8 +21,7 @@ def run_onnx_torch(onnx_model, inputs):
     torch_out = torch_model(*[torch.tensor(x) for x in inputs.values()])
   return torch_out
 
-OPENPILOT_MODEL = "https://github.com/commaai/openpilot/raw/7da48ebdba5e3cf4c0b8078c934bee9a199f0280/selfdrive/modeld/models/supercombo.onnx"
-#OPENPILOT_MODEL = "https://github.com/commaai/openpilot/raw/1f2f9ea9c9dc37bdea9c6e32e4cb8f88ea0a34bf/selfdrive/modeld/models/supercombo.onnx"
+OPENPILOT_MODEL = "https://github.com/commaai/openpilot/raw/v0.9.4/selfdrive/modeld/models/supercombo.onnx"
 
 np.random.seed(1337)
 
@@ -31,11 +34,11 @@ class TestOnnxModel(unittest.TestCase):
       np_inputs = {
         "input_imgs": np.random.randn(*(1, 12, 128, 256)),
         "big_input_imgs": np.random.randn(*(1, 12, 128, 256)),
-        "desire": np.zeros((1, 8)),
+        "desire": np.zeros((1, 100, 8)),
         "traffic_convention": np.array([[1., 0.]]),
-        "initial_state": np.zeros((1, 512))
-        #"initial_state": np.zeros((1, 768))
-      }
+        "nav_features": np.zeros((1, 256)),
+        "features_buffer": np.zeros((1, 99, 128)),
+    }
       inputs = {k:Tensor(v.astype(np.float32), requires_grad=False) for k,v in np_inputs.items()}
       return inputs
 
@@ -48,22 +51,24 @@ class TestOnnxModel(unittest.TestCase):
       mt2 = time.monotonic()
       tinygrad_out = tinygrad_out.numpy()
       et = time.monotonic()
-      print(f"ran openpilot model in {(et-st)*1000.0:.2f} ms, waited {(mt2-mt)*1000.0:.2f} ms for realize, {(et-mt2)*1000.0:.2f} ms for GPU queue")
+      if not CI: print(f"ran openpilot model in {(et-st)*1000.0:.2f} ms, waited {(mt2-mt)*1000.0:.2f} ms for realize, {(et-mt2)*1000.0:.2f} ms for GPU queue")
 
-    import cProfile
-    import pstats
-    inputs = get_inputs()
-    pr = cProfile.Profile(timer=time.perf_counter_ns, timeunit=1e-6)
-    pr.enable()
+    if not CI:
+      import cProfile
+      import pstats
+      inputs = get_inputs()
+      pr = cProfile.Profile(timer=time.perf_counter_ns, timeunit=1e-6)
+      pr.enable()
     tinygrad_out = run_onnx(inputs)['outputs']
     tinygrad_out.realize()
     tinygrad_out = tinygrad_out.numpy()
-    pr.disable()
-    stats = pstats.Stats(pr)
-    stats.dump_stats("/tmp/net.prof")
-    os.system("flameprof /tmp/net.prof > /tmp/prof.svg")
-    ps = stats.sort_stats(pstats.SortKey.TIME)
-    ps.print_stats(30)
+    if not CI:
+      pr.disable()
+      stats = pstats.Stats(pr)
+      stats.dump_stats(temp("net.prof"))
+      os.system(f"flameprof {temp('net.prof')} > {temp('prof.svg')}")
+      ps = stats.sort_stats(pstats.SortKey.TIME)
+      ps.print_stats(30)
 
   def test_openpilot_model(self):
     dat = fetch(OPENPILOT_MODEL)
@@ -73,10 +78,10 @@ class TestOnnxModel(unittest.TestCase):
     inputs = {
       "input_imgs": np.random.randn(*(1, 12, 128, 256)),
       "big_input_imgs": np.random.randn(*(1, 12, 128, 256)),
-      "desire": np.zeros((1, 8)),
+      "desire": np.zeros((1, 100, 8)),
       "traffic_convention": np.array([[1., 0.]]),
-      "initial_state": np.zeros((1, 512))
-      #"initial_state": np.zeros((1, 768))
+      "nav_features": np.zeros((1, 256)),
+      "features_buffer": np.zeros((1, 99, 128)),
     }
     inputs = {k:v.astype(np.float32) for k,v in inputs.items()}
 
